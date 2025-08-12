@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
     }
 }
 
-#[instrument(skip(client_socket, state, config))]
+#[instrument(skip(client_socket, client_addr, state, config, geo_reader))]
 async fn handle_connection(
     mut client_socket: TcpStream,
     client_addr: SocketAddr,
