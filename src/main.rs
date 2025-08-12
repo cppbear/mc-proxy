@@ -25,7 +25,7 @@ struct Cli {
 #[derive(Deserialize, Debug)]
 struct Config {
     listen_addr: String,
-    mc_server_addr: String,
+    server_addr: String,
     wake_command: String,
 }
 
@@ -84,22 +84,58 @@ async fn handle_connection(
     state: SharedServerState,
     config: Arc<Config>,
 ) -> Result<()> {
-    // 检查并触发唤醒流程（如果需要）
-    wait_for_server_online(state.clone(), config.clone()).await?;
+    let mut server_socket;
 
-    // 确定服务器已经在线
-    info!(
-        "Connecting to the backend MC server: {}",
-        config.mc_server_addr
-    );
-    let mut mc_server_socket = TcpStream::connect(&config.mc_server_addr).await?;
-    info!("Connection successful. Forwarding traffic.");
+    // 使用循环来处理“连接 -> 失败则唤醒 -> 重连”的逻辑
+    loop {
+        // 直接尝试连接进行在线检查
+        info!(
+            "Attempting to connect to backend server: {}...",
+            config.server_addr
+        );
+        match TcpStream::connect(&config.server_addr).await {
+            Ok(socket) => {
+                // 连接成功
+                info!("Successfully connected to backend server.");
+                server_socket = socket;
 
+                // 确保共享状态是 Online，以便其他并发连接可以跳过唤醒流程
+                let mut state_guard = state.lock().await;
+                if *state_guard != ServerStatus::Online {
+                    info!("Updating shared state to Online.");
+                    *state_guard = ServerStatus::Online;
+                }
+                break; // 跳出循环，进行流量转发
+            }
+            Err(e) => {
+                // 连接失败，服务器不在线
+                warn!(
+                    "Failed to connect to backend: {}. Assuming it's offline.",
+                    e
+                );
+
+                // 调用唤醒和轮询函数。
+                // 这个函数会处理状态转换 (Offline -> WakingUp -> Online)
+                // 并且会一直阻塞，直到服务器端口可以连接
+                wait_for_server_online(state.clone(), config.clone()).await?;
+
+                // 唤醒流程结束后，循环将继续，再次尝试连接
+                info!("Wake-up sequence finished. Retrying connection...");
+            }
+        }
+    }
+
+    // --- 流量转发 ---
+    info!("Connection established. Forwarding traffic.");
     let (bytes_sent, bytes_received) =
-        match io::copy_bidirectional(&mut client_socket, &mut mc_server_socket).await {
+        match io::copy_bidirectional(&mut client_socket, &mut server_socket).await {
             Ok((sent, received)) => (sent, received),
             Err(e) => {
                 error!("Error during traffic forwarding: {}", e);
+                // 如果转发时出错，也认为服务器可能掉线了，重置状态
+                let mut state_guard = state.lock().await;
+                *state_guard = ServerStatus::Offline;
+                warn!("Resetting server state to Offline due to a forwarding error.");
                 return Err(e.into());
             }
         };
@@ -156,10 +192,10 @@ async fn wait_for_server_online(state: SharedServerState, config: Arc<Config>) -
 
                 info!(
                     "Waiting for MC Server to respond at {}...",
-                    config.mc_server_addr
+                    config.server_addr
                 );
                 loop {
-                    if TcpStream::connect(&config.mc_server_addr).await.is_ok() {
+                    if TcpStream::connect(&config.server_addr).await.is_ok() {
                         let mut final_state_guard = state.lock().await;
                         *final_state_guard = ServerStatus::Online;
                         info!("Server is now online!");
