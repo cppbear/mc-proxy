@@ -12,6 +12,8 @@ use tokio::sync::Mutex;
 use tracing::{error, info, instrument, level_filters::LevelFilter, warn};
 use tracing_subscriber::FmtSubscriber;
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 // 接收命令行参数
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -90,11 +92,12 @@ async fn handle_connection(
     loop {
         // 直接尝试连接进行在线检查
         info!(
-            "Attempting to connect to backend server: {}...",
-            config.server_addr
+            "Attempting to connect to backend server: {} (timeout: {:?})",
+            config.server_addr, CONNECT_TIMEOUT
         );
-        match TcpStream::connect(&config.server_addr).await {
-            Ok(socket) => {
+        let connect_future = TcpStream::connect(&config.server_addr);
+        match tokio::time::timeout(CONNECT_TIMEOUT, connect_future).await {
+            Ok(Ok(socket)) => {
                 // 连接成功
                 info!("Successfully connected to backend server.");
                 server_socket = socket;
@@ -107,19 +110,19 @@ async fn handle_connection(
                 }
                 break; // 跳出循环，进行流量转发
             }
-            Err(e) => {
-                // 连接失败，服务器不在线
+            Ok(Err(e)) => {
+                // 连接操作本身返回了错误 (例如 Connection Refused)，服务器不在线
                 warn!(
-                    "Failed to connect to backend: {}. Assuming it's offline.",
+                    "Failed to connect to backend (connection error): {}. Assuming it's offline.",
                     e
                 );
-
-                // 调用唤醒和轮询函数。
-                // 这个函数会处理状态转换 (Offline -> WakingUp -> Online)
-                // 并且会一直阻塞，直到服务器端口可以连接
                 wait_for_server_online(state.clone(), config.clone()).await?;
-
-                // 唤醒流程结束后，循环将继续，再次尝试连接
+                info!("Wake-up sequence finished. Retrying connection...");
+            }
+            Err(_) => {
+                // 连接操作超时，服务器不在线
+                warn!("Failed to connect to backend (timed out). Assuming it's offline.");
+                wait_for_server_online(state.clone(), config.clone()).await?;
                 info!("Wake-up sequence finished. Retrying connection...");
             }
         }
