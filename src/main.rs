@@ -161,13 +161,13 @@ async fn handle_connection(
                     "Failed to connect to backend (connection error): {}. Assuming it's offline.",
                     e
                 );
-                trigger_wakeup_and_wait(state.clone(), config.clone()).await?;
+                trigger_wakeup(state.clone(), config.clone()).await?;
                 info!("Wake-up sequence finished. Retrying connection...");
             }
             Err(_) => {
                 // 连接操作超时，服务器不在线
                 warn!("Failed to connect to backend (timed out). Assuming it's offline.");
-                trigger_wakeup_and_wait(state.clone(), config.clone()).await?;
+                trigger_wakeup(state.clone(), config.clone()).await?;
                 info!("Wake-up sequence finished. Retrying connection...");
             }
         }
@@ -198,7 +198,7 @@ async fn handle_connection(
 
 /// 一个辅助函数，用于封装“重置状态 -> 触发唤醒”的通用逻辑
 #[instrument(skip(state, config))]
-async fn trigger_wakeup_and_wait(state: SharedServerState, config: Arc<Config>) -> Result<()> {
+async fn trigger_wakeup(state: SharedServerState, config: Arc<Config>) -> Result<()> {
     // 在调用唤醒流程前，立即将状态重置为 Offline
     {
         let mut state_guard = state.lock().await;
@@ -208,10 +208,11 @@ async fn trigger_wakeup_and_wait(state: SharedServerState, config: Arc<Config>) 
         }
     } // 锁在这里被释放
 
-    wait_for_server_online(state, config).await
+    wait_for_server(state, config).await
 }
 
-async fn wait_for_server_online(state: SharedServerState, config: Arc<Config>) -> Result<()> {
+#[instrument(skip(state, config))]
+async fn wait_for_server(state: SharedServerState, config: Arc<Config>) -> Result<()> {
     loop {
         let mut state_guard = state.lock().await;
         match *state_guard {
