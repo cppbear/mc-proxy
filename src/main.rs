@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
+use maxminddb::{Reader, geoip2};
 use serde::Deserialize;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,12 +25,12 @@ struct Cli {
     config: PathBuf,
 }
 
-// 匹配 TOML 配置文件的结构
 #[derive(Deserialize, Debug)]
 struct Config {
     listen_addr: String,
     server_addr: String,
     wake_command: String,
+    geoip_db_path: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -42,25 +44,23 @@ type SharedServerState = Arc<Mutex<ServerStatus>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 初始化日志记录器
     let subscriber = FmtSubscriber::builder()
         .with_max_level(LevelFilter::INFO)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    // 解析命令行参数并读取配置文件
     let cli = Cli::parse();
     info!("Loading configuration from: {:?}", cli.config);
     let config_content = fs::read_to_string(&cli.config)?;
     let config: Config = toml::from_str(&config_content)?;
     info!("Configuration loaded: {:?}", config);
-
-    // 将配置包装在 Arc 中以便在任务间高效共享
     let config = Arc::new(config);
+
+    info!("Loading GeoIP database from: {}", &config.geoip_db_path);
+    let geo_reader = Arc::new(Reader::open_readfile(&config.geoip_db_path)?);
 
     let server_state = Arc::new(Mutex::new(ServerStatus::Offline));
 
-    // 使用配置中的监听地址
     let listener = TcpListener::bind(&config.listen_addr).await?;
     info!("Proxy server starting on {}...", config.listen_addr);
 
@@ -69,11 +69,19 @@ async fn main() -> Result<()> {
         info!("Accepted connection from {}", client_addr);
 
         let state_clone = Arc::clone(&server_state);
-        // 克隆配置的 Arc 引用
         let config_clone = Arc::clone(&config);
+        let geo_reader_clone = geo_reader.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client_socket, state_clone, config_clone).await {
+            if let Err(e) = handle_connection(
+                client_socket,
+                client_addr,
+                state_clone,
+                config_clone,
+                geo_reader_clone,
+            )
+            .await
+            {
                 error!("Error handling connection from {}: {}", client_addr, e);
             }
         });
@@ -83,9 +91,46 @@ async fn main() -> Result<()> {
 #[instrument(skip(client_socket, state, config))]
 async fn handle_connection(
     mut client_socket: TcpStream,
+    client_addr: SocketAddr,
     state: SharedServerState,
     config: Arc<Config>,
+    geo_reader: Arc<Reader<Vec<u8>>>,
 ) -> Result<()> {
+    let client_ip = client_addr.ip();
+    match geo_reader.lookup::<geoip2::Country>(client_ip) {
+        Ok(country_data) => {
+            if let Some(country_code) = country_data
+                .and_then(|data| data.country)
+                .and_then(|c| c.iso_code)
+            {
+                info!(
+                    "Client IP {} resolved to country: {}",
+                    client_ip, country_code
+                );
+                if country_code != "CN" {
+                    warn!(
+                        "Blocking connection from {} ({}) as it's not from China.",
+                        client_ip, country_code
+                    );
+                    // 直接返回，会隐式地关闭连接
+                    return Ok(());
+                }
+            } else {
+                warn!(
+                    "Could not determine country for IP {}. Allowing connection by default.",
+                    client_ip
+                );
+            }
+        }
+        Err(e) => {
+            // IP 地址在数据库中未找到，可能是私有地址或数据库不完整
+            warn!(
+                "IP lookup failed for {}: {}. Allowing connection by default.",
+                client_ip, e
+            );
+        }
+    }
+
     let mut server_socket;
 
     // 使用循环来处理“连接 -> 失败则唤醒 -> 重连”的逻辑
